@@ -1,0 +1,169 @@
+name: Release app
+
+# Publishes the next version of a Coalesce app: checks the repository against the app store's
+# install rules, raises the version in apps/<repo>/package.json, turns the CHANGELOG's
+# "## [Unreleased]" section into the release notes, then commits, tags v<version> and creates a
+# GitHub Release. The app store offers every v<major>.<minor>.<patch> tag as an installable version.
+#
+# Called by an app repository's release.yml. To share it across app repositories, move this file
+# to a shared repository and point each caller's `uses:` at it.
+
+on:
+  workflow_call:
+    inputs:
+      bump:
+        description: Which part of the version to raise (patch, minor or major)
+        type: string
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require the default branch
+        if: github.ref_name != github.event.repository.default_branch
+        run: |
+          echo "::error::Run the release from ${{ github.event.repository.default_branch }}, not ${{ github.ref_name }}."
+          exit 1
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Check the app and stamp the next version
+        id: prepare
+        env:
+          BUMP: ${{ inputs.bump }}
+          REPO_NAME: ${{ github.event.repository.name }}
+          NOTES_FILE: ${{ runner.temp }}/release-notes.md
+        run: |
+          node --input-type=module - <<'SCRIPT'
+          // Checks an app repository against the Coalesce app store's install rules, works out the next
+          // version, and stamps it into the app's package.json and CHANGELOG.md.
+          //
+          // Env: BUMP (patch | minor | major), REPO_NAME, NOTES_FILE and GITHUB_OUTPUT (both optional).
+          // Writes `version` and `has_notes` to GITHUB_OUTPUT and the release notes to NOTES_FILE.
+          import { execFileSync } from "node:child_process";
+          import { appendFileSync, existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+          import path from "node:path";
+
+          const fail = (message) => {
+            console.log(`::error::${message}`);
+            process.exit(1);
+          };
+
+          const bump = process.env.BUMP;
+          const repoName = process.env.REPO_NAME;
+          if (!["patch", "minor", "major"].includes(bump)) fail(`BUMP must be patch, minor or major, not "${bump}"`);
+          if (!repoName) fail("REPO_NAME is not set");
+
+          // The same rules the app store applies when it lists and installs an app.
+          if (!/^[a-z0-9][a-z0-9-]*$/.test(repoName) || /^(con|prn|aux|nul|com\d|lpt\d)$/.test(repoName)) {
+            fail(`The repository name "${repoName}" can't be an app id: use lowercase letters, digits and dashes.`);
+          }
+          if (!existsSync("apps")) fail("The repository has no apps/ directory.");
+          const appIds = readdirSync("apps", { withFileTypes: true })
+            .filter((entry) => entry.isDirectory())
+            .map((entry) => entry.name);
+          if (appIds.length !== 1) {
+            fail(`apps/ must hold exactly one folder, apps/${repoName}/, but holds ${appIds.length}: ${appIds.join(", ") || "none"}.`);
+          }
+          if (appIds[0] !== repoName) fail(`The app folder must be named after the repository: apps/${repoName}/, not apps/${appIds[0]}/.`);
+
+          const appDir = path.join("apps", repoName);
+          const packagePath = path.join(appDir, "package.json");
+          if (!existsSync(packagePath)) fail(`${packagePath} is missing.`);
+          let pkg;
+          try {
+            pkg = JSON.parse(readFileSync(packagePath, "utf8"));
+          } catch (error) {
+            fail(`${packagePath} isn't valid JSON: ${error.message}`);
+          }
+          const start = typeof pkg.scripts?.start === "string" ? pkg.scripts.start.trim() : "";
+          const startTokens = start.split(/\s+/);
+          if (startTokens[0] !== "node" || startTokens.length < 2 || /[;&|<>`$(){}*?[\]~"'\\]/.test(start)) {
+            fail(`scripts.start must be "node <file>" (no npm, no shell syntax), but is "${start}".`);
+          }
+          const entry = startTokens.slice(1).find((token) => !token.startsWith("-"));
+          if (entry && !existsSync(path.join(appDir, entry))) fail(`scripts.start runs ${entry}, which isn't in ${appDir}/.`);
+
+          // Next version: bump the newest stable v<major>.<minor>.<patch> tag. A first release publishes
+          // the version already in package.json.
+          const git = (...args) => execFileSync("git", args, { encoding: "utf8" }).trim();
+          const parse = (version) => version.match(/^(\d+)\.(\d+)\.(\d+)$/)?.slice(1).map(Number);
+          const tagged = git("tag", "--list", "v*")
+            .split("\n")
+            .map((tag) => parse(tag.slice(1)))
+            .filter(Boolean)
+            .sort((a, b) => a[0] - b[0] || a[1] - b[1] || a[2] - b[2]);
+          const latest = tagged.at(-1);
+          let version;
+          if (latest) {
+            const latestTag = `v${latest.join(".")}`;
+            if (git("rev-list", "--count", `${latestTag}..HEAD`) === "0") fail(`Nothing to release: main has no commits since ${latestTag}.`);
+            const [major, minor, patch] = latest;
+            version = { major: `${major + 1}.0.0`, minor: `${major}.${minor + 1}.0`, patch: `${major}.${minor}.${patch + 1}` }[bump];
+          } else {
+            version = pkg.version;
+            if (!parse(version ?? "")) fail(`There are no release tags yet, and package.json's version "${version}" isn't <major>.<minor>.<patch>.`);
+          }
+          if (git("tag", "--list", `v${version}`)) fail(`v${version} is already tagged.`);
+
+          // package.json: replace the version in place so the rest of the file keeps its formatting.
+          const packageText = readFileSync(packagePath, "utf8");
+          const versionField = /("version"\s*:\s*")[^"]*(")/;
+          writeFileSync(
+            packagePath,
+            versionField.test(packageText)
+              ? packageText.replace(versionField, `$1${version}$2`)
+              : `${JSON.stringify({ ...pkg, version }, null, 2)}\n`
+          );
+
+          // CHANGELOG.md: an "## [Unreleased]" section becomes this version's section and its notes.
+          let notes = "";
+          const changelogPath = path.join(appDir, "CHANGELOG.md");
+          if (existsSync(changelogPath)) {
+            const changelog = readFileSync(changelogPath, "utf8");
+            const unreleased = changelog.match(/^## \[?Unreleased\]?[^\n]*\n([\s\S]*?)(?=^## |(?![\s\S]))/im);
+            notes = unreleased?.[1].trim() ?? "";
+            if (notes) {
+              const date = new Date().toISOString().slice(0, 10);
+              const released = `## [Unreleased]\n\n## [${version}] - ${date}\n\n${notes}\n\n`;
+              writeFileSync(changelogPath, changelog.replace(unreleased[0], () => released));
+            }
+          }
+          writeFileSync(process.env.NOTES_FILE ?? "release-notes.md", `${notes}\n`);
+
+          console.log(`Releasing ${repoName} v${version}${latest ? ` (was v${latest.join(".")})` : ""}`);
+          if (process.env.GITHUB_OUTPUT) {
+            appendFileSync(process.env.GITHUB_OUTPUT, `version=${version}\nhas_notes=${notes ? "true" : "false"}\n`);
+          }
+          SCRIPT
+
+      - name: Commit, tag and publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ github.ref_name }}
+          VERSION: ${{ steps.prepare.outputs.version }}
+          HAS_NOTES: ${{ steps.prepare.outputs.has_notes }}
+          NOTES_FILE: ${{ runner.temp }}/release-notes.md
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add apps
+          git commit -m "Release v$VERSION"
+          git tag -a "v$VERSION" -m "v$VERSION"
+          git push --atomic origin "HEAD:$BRANCH" "v$VERSION"
+          if [ "$HAS_NOTES" = true ]; then
+            gh release create "v$VERSION" --verify-tag --title "v$VERSION" --notes-file "$NOTES_FILE"
+          else
+            gh release create "v$VERSION" --verify-tag --title "v$VERSION" --generate-notes
+          fi
+          echo "Published v$VERSION" >> "$GITHUB_STEP_SUMMARY"
