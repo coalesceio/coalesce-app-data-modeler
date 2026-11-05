@@ -1,0 +1,27 @@
+name: Release
+
+# Adds a "Run workflow" button under Actions › Release that publishes the next version of this app.
+# Before running it, add the changes to an "## [Unreleased]" section of the app's CHANGELOG.md;
+# they become the release notes. Without one, GitHub writes the notes from the commits.
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Which part of the version to raise
+        type: choice
+        options: [patch, minor, major]
+        default: patch
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    uses: ./.github/workflows/release-app.yml
+    with:
+      bump: ${{ inputs.bump }}
